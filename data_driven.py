@@ -8,9 +8,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
-# ---------------------------
 # Reproducibility
-# ---------------------------
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
@@ -19,10 +17,7 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-# ---------------------------
-# Dataset
 # CSV layout per sample: [Pgen(8), Pload(8), theta(8)] -> total 24 columns
-# ---------------------------
 class DCPFDataset(Dataset):
     def __init__(self, csv_path, input_mean=None, input_std=None, target_mean=None, target_std=None, fit_stats=False):
         arr = pd.read_csv(csv_path, header=None).values.astype(np.float32)
@@ -69,19 +64,14 @@ class LinearDCPF(nn.Module):
     def forward(self, x):
         return self.lin(x)
 
-# ---------------------------
-# Metrics
-# Error (%) ~ mean over all elements: |y_pred - y_true| / (|y_true| + eps) * 100
-# ---------------------------
 def mean_relative_error_percent(y_true, y_pred, eps=1e-6):
+    # RMSPE: Root Mean Squared Percentage Error
     with torch.no_grad():
-        num = (y_pred - y_true).abs()
-        den = y_true.abs() + eps
-        return (num / den).mean().item() * 100.0
+        rel_err_sq = ((y_pred - y_true) / (y_true + eps)) ** 2
+        rmspe = torch.sqrt(rel_err_sq.mean()).item() * 100.0
+        return rmspe
 
-# ---------------------------
 # Train & Eval
-# ---------------------------
 def train_one_model(train_csv, test_csv_list, device="cuda" if torch.cuda.is_available() else "cpu",
                     epochs=400, batch_size=64, lr=5e-3, weight_decay=1e-4, seed=42):
     set_seed(seed)
