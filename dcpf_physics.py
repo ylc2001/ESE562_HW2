@@ -7,52 +7,34 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
+from scipy.io import loadmat
 
-try:
-    from scipy.io import loadmat
-except Exception as e:
-    loadmat = None
-
-# ---------------------------
 # Reproducibility
-# ---------------------------
 def set_seed(seed=42):
-    random.seed(seed); np.random.seed(seed)
-    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-# ---------------------------
-# Dataset
-# CSV per sample: [Pgen(8), Pload(8), theta(8)] -> 24 columns
-# Return both normalized tensors (for model) and raw (for physics loss & metrics)
-# ---------------------------
 class DCPFDataset(Dataset):
     def __init__(self, csv_path, input_mean=None, input_std=None, target_mean=None, target_std=None, fit_stats=False):
         arr = pd.read_csv(csv_path, header=None).values.astype(np.float32)
-        assert arr.shape[1] == 24, f"Expected 24 columns, got {arr.shape[1]}"
-        self.x_raw = arr[:, :16]     # raw [Pgen(8), Pload(8)]
-        self.y_raw = arr[:, 16:]     # raw theta(8)
-
-        # compute or use provided normalization stats
+        self.x_raw = arr[:, :16]
+        self.y_raw = arr[:, 16:]
         if fit_stats:
             self.input_mean = self.x_raw.mean(axis=0, keepdims=True)
             self.input_std  = self.x_raw.std(axis=0, keepdims=True) + 1e-8
             self.target_mean = self.y_raw.mean(axis=0, keepdims=True)
             self.target_std  = self.y_raw.std(axis=0, keepdims=True) + 1e-8
         else:
-            assert input_mean is not None and input_std is not None
-            assert target_mean is not None and target_std is not None
             self.input_mean = input_mean; self.input_std = input_std
             self.target_mean = target_mean; self.target_std = target_std
-
-        # standardize
         self.xn = (self.x_raw - self.input_mean) / self.input_std
         self.yn = (self.y_raw - self.target_mean) / self.target_std
-
-    def __len__(self):
-        return self.x_raw.shape[0]
-
+    def __len__(self): return self.x_raw.shape[0]
     def __getitem__(self, idx):
         return {
             "xn": torch.from_numpy(self.xn[idx]),
@@ -61,249 +43,158 @@ class DCPFDataset(Dataset):
             "y_raw": torch.from_numpy(self.y_raw[idx]),
         }
 
-# ---------------------------
-# Model: linear mapping 16 -> 8
-# ---------------------------
 class LinearDCPF(nn.Module):
     def __init__(self, in_dim=16, out_dim=8):
         super().__init__()
         self.lin = nn.Linear(in_dim, out_dim, bias=True)
-    def forward(self, x):
-        return self.lin(x)
+    def forward(self, x): return self.lin(x)
 
-# ---------------------------
-# Metrics
-# Error (%) = mean over all elements: |y_pred - y_true| / (|y_true| + eps) * 100
-# ---------------------------
 def mean_relative_error_percent(y_true, y_pred, eps=1e-6):
+    # RMSPE: Root Mean Squared Percentage Error
     with torch.no_grad():
-        num = (y_pred - y_true).abs()
-        den = y_true.abs() + eps
-        return (num / den).mean().item() * 100.0
+        rel_err_sq = ((y_pred - y_true) / (y_true + eps)) ** 2
+        rmspe = torch.sqrt(rel_err_sq.mean()).item() * 100.0
+        return rmspe
 
 # ---------------------------
 # Physics-informed loss (normalized)
 # Loss = alpha * Loss_data + Loss_phys
 # where:
-#   Loss_data = MSE(θ̂, θ) / (MSE(0, θ) + eps)
-#   Loss_phys = MSE(B_pf θ̂, Pgen - Pload) / (MSE(0, Pgen-Pload) + eps)
+#   Loss_data = MSE(θ̂, θ)
+#   Loss_phys = MSE(B_pf θ̂ - (Pgen - Pload))
 # Pred θ̂ is de-standardized back to raw scale before computing both terms.
 # ---------------------------
 def compute_losses(batch, y_pred_n, tgt_mean, tgt_std, B_pf, device, alpha=1.0, eps=1e-12):
-    # de-standardize prediction and target to raw scale
     tgt_mean_t = torch.from_numpy(tgt_mean).to(device)
     tgt_std_t  = torch.from_numpy(tgt_std).to(device)
     y_pred = y_pred_n * tgt_std_t + tgt_mean_t
-    y_true = batch["y_raw"].to(device)
+    y_true_n = batch["yn"].to(device)
 
-    # data term (normalized)
-    mse_data = ((y_pred - y_true) ** 2).mean()
-    denom_data = (y_true ** 2).mean() + eps
-    loss_data = mse_data / denom_data
+    # Loss_data: MSE(θ̂, θ)
+    loss_data = torch.nn.functional.mse_loss(y_pred_n, y_true_n)
 
-    # physics term (normalized)
-    x_raw = batch["x_raw"].to(device)
+    # Loss_phys: MSE(B_pf θ̂ - (Pgen - Pload))
+    x_raw = batch["x_raw"].to(device)           # shape: [batch, 16]
     pgen = x_raw[:, :8]
     pload = x_raw[:, 8:]
-    rhs = pgen - pload
-    lhs = torch.matmul(y_pred, torch.from_numpy(B_pf.T).to(device))  # (B_pf @ theta) -> careful with row vs col, use θ row * B^T
-    mse_phys = ((lhs - rhs) ** 2).mean()
-    denom_phys = (rhs ** 2).mean() + eps
-    loss_phys = mse_phys / denom_phys
+    rhs = pgen - pload                         # shape: [batch, 8]
+    B_pf_t = torch.from_numpy(B_pf.T).to(device)  # shape: [8, 8]
+    lhs = torch.matmul(y_pred, B_pf_t)         # shape: [batch, 8]
+    loss_phys = torch.nn.functional.mse_loss(lhs, rhs)
 
-    total = alpha * loss_data + loss_phys
-    return total, loss_data.detach(), loss_phys.detach()
+    # print(f"Data Loss: {loss_data.item():.6f}, Phys Loss: {loss_phys.item():.6f}")
 
-# ---------------------------
-# Training & Evaluation
-# ---------------------------
-def train_one_model(
-    train_csv, test_csv_list, B_pf, device="cuda" if torch.cuda.is_available() else "cpu",
-    alpha=1.0, epochs=400, batch_size=64, lr=5e-3, weight_decay=1e-4, seed=42, log_prefix=None
-):
+    total_loss = alpha * loss_data + loss_phys
+    return total_loss
+
+# Train one model
+def train_one_model(train_csv, test_csv_list, B_pf, alpha=1.0, device="cpu",
+                    epochs=400, batch_size=64, lr=5e-3, wd=1e-4, seed=42):
     set_seed(seed)
-
-    # Fit normalization on training set
     ds_fit = DCPFDataset(train_csv, fit_stats=True)
     in_mean, in_std = ds_fit.input_mean, ds_fit.input_std
     tgt_mean, tgt_std = ds_fit.target_mean, ds_fit.target_std
-
     train_ds = DCPFDataset(train_csv, input_mean=in_mean, input_std=in_std,
                            target_mean=tgt_mean, target_std=tgt_std, fit_stats=False)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, drop_last=False)
+    loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
 
-    # Prepare tests with same normalization as training
-    test_sets = {}
-    for name, path in test_csv_list.items():
-        test_sets[name] = DCPFDataset(path, input_mean=in_mean, input_std=in_std,
-                                      target_mean=tgt_mean, target_std=tgt_std, fit_stats=False)
+    test_sets = {k:DCPFDataset(v,in_mean,in_std,tgt_mean,tgt_std) for k,v in test_csv_list.items()}
 
     model = LinearDCPF().to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
 
-    history = {"epoch": [], "total": [], "data": [], "phys": []}
-
-    # Training loop
-    model.train()
+    history = []
     for ep in range(epochs):
-        total_epoch = data_epoch = phys_epoch = 0.0
-        n_batches = 0
-        for batch in train_loader:
-            xb = batch["xn"].to(device)
-            yb = batch["yn"].to(device)
+        total_ep=0; n=0
+        for batch in loader:
+            xb, yb = batch["xn"].to(device), batch["yn"].to(device)
             y_pred_n = model(xb)
+            loss = compute_losses(batch,y_pred_n,tgt_mean,tgt_std,B_pf,device,alpha)
+            opt.zero_grad(); loss.backward(); opt.step()
+            total_ep += loss.item(); n+=1
+        history.append(total_ep/n)
 
-            total_loss, data_loss, phys_loss = compute_losses(
-                batch, y_pred_n, tgt_mean, tgt_std, B_pf, device, alpha=alpha
-            )
-
-            opt.zero_grad()
-            total_loss.backward()
-            opt.step()
-
-            total_epoch += total_loss.item()
-            data_epoch  += data_loss.item()
-            phys_epoch  += phys_loss.item()
-            n_batches   += 1
-
-        history["epoch"].append(ep+1)
-        history["total"].append(total_epoch / max(1, n_batches))
-        history["data"].append(data_epoch / max(1, n_batches))
-        history["phys"].append(phys_epoch / max(1, n_batches))
-
-    # Evaluate on train and tests (in raw scale for % error)
-    model.eval()
-    results = {}
-    with torch.no_grad():
-        # Train set
-        xb = torch.from_numpy(train_ds.xn).to(device)
-        y_true_n = torch.from_numpy(train_ds.yn).to(device)
-        y_pred_n = model(xb)
-
-        tgt_mean_t = torch.from_numpy(tgt_mean).to(device)
-        tgt_std_t  = torch.from_numpy(tgt_std).to(device)
-        y_true = y_true_n * tgt_std_t + tgt_mean_t
-        y_pred = y_pred_n * tgt_std_t + tgt_mean_t
-        results["train"] = mean_relative_error_percent(y_true, y_pred)
-
-        for name, ds in test_sets.items():
-            xb = torch.from_numpy(ds.xn).to(device)
-            y_true_n = torch.from_numpy(ds.yn).to(device)
-            y_pred_n = model(xb)
-
-            y_true = y_true_n * tgt_std_t + tgt_mean_t
-            y_pred = y_pred_n * tgt_std_t + tgt_mean_t
-            results[name] = mean_relative_error_percent(y_true, y_pred)
-
-    # Optional: save logs for convergence plots
-    if log_prefix is not None:
-        pd.DataFrame(history).to_csv(f"{log_prefix}_loss_curve.csv", index=False)
-
+    # evaluation
+    results={}
+    for name,ds in {"train":train_ds, **test_sets}.items():
+        xb=torch.from_numpy(ds.xn).to(device)
+        y_true_n=torch.from_numpy(ds.yn).to(device)
+        y_pred_n=model(xb)
+        tgt_mean_t=torch.from_numpy(tgt_mean).to(device)
+        tgt_std_t=torch.from_numpy(tgt_std).to(device)
+        y_true=y_true_n*tgt_std_t+tgt_mean_t
+        y_pred=y_pred_n*tgt_std_t+tgt_mean_t
+        results[name]=mean_relative_error_percent(y_true,y_pred)
     return results, history
 
-def load_Bpf(mat_path="B_pf.mat"):
-    if loadmat is None:
-        raise RuntimeError("scipy is not available to load .mat; install scipy or provide B as .npy")
-    mat = loadmat(mat_path)
-    if "B_pf" not in mat:
-        raise KeyError("B_pf variable not found in the .mat file")
-    B = mat["B_pf"].astype(np.float32)
-    # Ensure shape (n_bus, n_bus)
-    assert B.ndim == 2 and B.shape[0] == B.shape[1], f"Unexpected B_pf shape: {B.shape}"
-    return B
-
+# ---------------------------
+# Main
+# ---------------------------
 def main():
-    parser = argparse.ArgumentParser()
-    # data paths
-    parser.add_argument("--train1", default="train_set1.csv")
-    parser.add_argument("--train2", default="train_set2.csv")
-    parser.add_argument("--test1",  default="test_set1.csv")
-    parser.add_argument("--test2",  default="test_set2.csv")
-    parser.add_argument("--Bmat",   default="B_pf.mat")
+    parser=argparse.ArgumentParser()
+    parser.add_argument("--train1",default="train_set1.csv")
+    parser.add_argument("--train2",default="train_set2.csv")
+    parser.add_argument("--test1", default="test_set1.csv")
+    parser.add_argument("--test2", default="test_set2.csv")
+    parser.add_argument("--Bmat",  default="B_pf.mat")
+    parser.add_argument("--epochs",type=int,default=400)
+    parser.add_argument("--run_a",action="store_true")
+    parser.add_argument("--run_b",action="store_true")
+    args=parser.parse_args()
 
-    # training hyperparams
-    parser.add_argument("--epochs", type=int, default=400)
-    parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--lr", type=float, default=5e-3)
-    parser.add_argument("--wd", type=float, default=1e-4)
-    parser.add_argument("--seed", type=int, default=42)
+    B_pf=loadmat(args.Bmat)["B_pf"].astype(np.float32)
+    device="cuda" if torch.cuda.is_available() else "cpu"
 
-    # which parts to run
-    parser.add_argument("--run_a", action="store_true", help="Run part (a): alpha=0, four combos")
-    parser.add_argument("--run_b", action="store_true", help="Run part (b): Train2->Test2, alpha in {0,1,10}")
-
-    args = parser.parse_args()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # Load B matrix
-    B_pf = load_Bpf(args.Bmat)
-
-    # ----------------------
-    # (a) alpha=0, four combos
-    # ----------------------
     if args.run_a:
-        alpha = 0.0
-        combos = [
-            ("Train1(±20%, N=1000) → Test1(±20%, N=1000)", args.train1, {"Test1": args.test1}),
-            ("Train1(±20%, N=1000) → Test2(±40%, N=1000)", args.train1, {"Test2": args.test2}),
-            ("Train2(±20%, N=200)  → Test1(±20%, N=1000)", args.train2, {"Test1": args.test1}),
-            ("Train2(±20%, N=200)  → Test2(±40%, N=1000)", args.train2, {"Test2": args.test2}),
+        alpha=0.0
+        combos=[
+            ("Train1→Test1",args.train1,{"Test1":args.test1}),
+            ("Train1→Test2",args.train1,{"Test2":args.test2}),
+            ("Train2→Test1",args.train2,{"Test1":args.test1}),
+            ("Train2→Test2",args.train2,{"Test2":args.test2}),
         ]
-        rows = []
-        for title, train_csv, test_dict in combos:
-            res, _ = train_one_model(
-                train_csv=train_csv,
-                test_csv_list=test_dict,
-                B_pf=B_pf,
-                device=device,
-                alpha=alpha,
-                epochs=args.epochs,
-                batch_size=args.batch_size,
-                lr=args.lr,
-                weight_decay=args.wd,
-                seed=args.seed,
-                log_prefix=None
-            )
-            row = {"Combo": title, "Alpha": alpha, "TrainError(%)": round(res["train"], 6)}
-            for k, v in res.items():
-                if k == "train": continue
-                row[f"{k}Error(%)"] = round(v, 6)
-            rows.append(row)
-        print("\n=== (a) Physics-only (alpha=0) Results ===")
-        df_a = pd.DataFrame(rows)
-        ordered = ["Combo", "Alpha", "TrainError(%)", "Test1Error(%)", "Test2Error(%)"]
-        print(df_a.reindex(columns=[c for c in ordered if c in df_a.columns]).to_string(index=False))
+        labels=[]; test_errs=[]
+        for title,tr,ts in combos:
+            res,_=train_one_model(tr,ts,B_pf,alpha,device,epochs=args.epochs)
+            labels.append(title); 
+            # pick whichever test set exists
+            key=[k for k in res.keys() if k.startswith("Test")][0]
+            test_errs.append(res[key])
+
+            # print result for this combo
+            print(f"{title}: {round(res[key], 6)}")
+        plt.figure()
+        plt.bar(labels,test_errs)
+        plt.ylabel("Test Error (%)")
+        plt.title("Part (a): Physics-only α=0")
+        plt.savefig("part_a_bar.png",dpi=200)
+        plt.close()
 
     # ----------------------
     # (b) Train2->Test2, alpha in {0,1,10}; log curves for convergence speed
     # ----------------------
     if args.run_b:
-        alphas = [0.0, 1.0, 10.0]
-        rows = []
-        for alpha in alphas:
-            res, hist = train_one_model(
-                train_csv=args.train2,
-                test_csv_list={"Test2": args.test2},
-                B_pf=B_pf,
-                device=device,
-                alpha=alpha,
-                epochs=args.epochs,
-                batch_size=args.batch_size,
-                lr=args.lr,
-                weight_decay=args.wd,
-                seed=args.seed,
-                log_prefix=f"train2_test2_alpha{alpha:g}"
-            )
-            rows.append({
-                "Combo": "Train2(±20%, N=200) → Test2(±40%, N=1000)",
-                "Alpha": alpha,
-                "TrainError(%)": round(res["train"], 6),
-                "Test2Error(%)": round(res["Test2"], 6)
-            })
-        print("\n=== (b) Convergence & Final Accuracy (Train2→Test2) ===")
-        df_b = pd.DataFrame(rows)
-        print(df_b.to_string(index=False))
-        print("\nSaved loss curves: train2_test2_alpha{0,1,10}_loss_curve.csv (columns: epoch,total,data,phys)")
+        alphas=[0,1,10]; histories=[]; test_errs=[]
+        for a in alphas:
+            res,hist=train_one_model(args.train2,{"Test2":args.test2},B_pf,a,device,epochs=args.epochs)
+            histories.append((a,hist)); test_errs.append((a,res["Test2"]))
+        plt.figure()
+        for a,hist in histories:
+            plt.plot(hist,label=f"α={a}")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title("Part (b): Convergence (Train2→Test2)")
+        plt.yscale('log')
+        plt.legend()
+        plt.savefig("part_b_curve.png",dpi=200)
+        plt.close()
+        plt.figure()
+        xs=[str(a) for a,_ in test_errs]; ys=[v for _,v in test_errs]
+        # print these results
+        for a,v in test_errs:
+            print(f"α={a}: {round(v,6)}")
+        plt.bar(xs,ys); plt.ylabel("Test2 Error (%)"); plt.title("Part (b): Final Accuracy")
+        plt.savefig("part_b_bar.png",dpi=200); plt.close()
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()

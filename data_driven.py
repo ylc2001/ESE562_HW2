@@ -72,7 +72,7 @@ def mean_relative_error_percent(y_true, y_pred, eps=1e-6):
         return rmspe
 
 # Train & Eval
-def train_one_model(train_csv, test_csv_list, device="cuda" if torch.cuda.is_available() else "cpu",
+def train_one_model(train_csv, test_csv_list, device="cpu",
                     epochs=400, batch_size=64, lr=5e-3, weight_decay=1e-4, seed=42):
     set_seed(seed)
 
